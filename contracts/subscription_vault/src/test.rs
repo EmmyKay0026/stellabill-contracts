@@ -1,184 +1,271 @@
-﻿#![cfg(test)]
-
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env,
-};
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::Env;
 
-fn setup() -> (Env, Address, Address, Address) {
+const MIN_TOPUP: i128 = 1_000_000;
+
+fn setup() -> (Env, SubscriptionVaultClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
-    let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_address = token_contract_id.address();
-    let contract_id = env.register_contract(None, SubscriptionVault);
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    SubscriptionVaultClient::new(&env, &contract_id).init(&token_address, &admin);
-    (env, contract_id, token_address, admin)
+    let token = Address::generate(&env);
+    client.init(&admin, &token, &MIN_TOPUP);
+    (env, client)
 }
 
-fn fund_subscription(
-    env: &Env,
-    token_address: &Address,
-    contract_id: &Address,
-    subscription_id: u64,
-    subscriber: &Address,
-    amount: i128,
-) {
-    StellarAssetClient::new(env, token_address).mint(subscriber, &amount);
-    SubscriptionVaultClient::new(env, contract_id).deposit_funds(&subscription_id, &amount);
-}
-
-fn make_subscription(
-    env: &Env,
-    contract_id: &Address,
-    subscriber: &Address,
-    merchant: &Address,
-    amount: i128,
-    interval_seconds: u64,
-) -> u64 {
-    SubscriptionVaultClient::new(env, contract_id)
-        .create_subscription(subscriber, merchant, &amount, &interval_seconds, &false)
+fn make_sub(env: &Env, client: &SubscriptionVaultClient<'static>, expires_at: Option<u64>) -> u32 {
+    let subscriber = Address::generate(env);
+    let merchant = Address::generate(env);
+    client.create_subscription(&subscriber, &merchant, &1000i128, &3600u64, &false, &expires_at)
 }
 
 #[test]
-fn test_charge_subscription_success() {
-    let (env, contract_id, token_address, _admin) = setup();
-    let subscriber = Address::generate(&env);
-    let merchant = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 100, 86_400);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 86_401);
-    fund_subscription(&env, &token_address, &contract_id, id, &subscriber, 100);
-    SubscriptionVaultClient::new(&env, &contract_id).charge_subscription(&id);
-    let sub = SubscriptionVaultClient::new(&env, &contract_id).get_subscription(&id);
-    assert_eq!(sub.prepaid_balance, 0);
-    assert_eq!(sub.status, SubscriptionStatus::Active);
+fn version_is_zero() {
+    let env = Env::default();
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    assert_eq!(client.version(), 0);
+}
+
+// --- init / config persistence ----------------------------------------------
+
+#[test]
+fn test_get_min_topup_returns_init_value() {
+    let (_env, client) = setup();
+    assert_eq!(client.get_min_topup(), MIN_TOPUP);
 }
 
 #[test]
-fn test_charge_subscription_insufficient_balance() {
-    let (env, contract_id, _token_address, _admin) = setup();
-    let subscriber = Address::generate(&env);
-    let merchant = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 100, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    let result = SubscriptionVaultClient::new(&env, &contract_id).try_charge_subscription(&id);
-    assert!(result.is_err());
-    let sub = SubscriptionVaultClient::new(&env, &contract_id).get_subscription(&id);
-    assert_eq!(sub.status, SubscriptionStatus::InsufficientBalance);
+fn test_double_init_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let result = client.try_init(&admin, &token, &MIN_TOPUP);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+// --- storage key isolation --------------------------------------------------
+
+#[test]
+fn test_config_readable_after_subscription_creation() {
+    let (env, client) = setup();
+    let id = make_sub(&env, &client, None);
+    assert_eq!(id, 0);
+    assert_eq!(client.get_min_topup(), MIN_TOPUP);
+}
+
+// --- charge_subscription expiration guard -----------------------------------
+
+#[test]
+fn test_charge_before_expiration_succeeds() {
+    let (env, client) = setup();
+    let now = env.ledger().timestamp();
+    let future = now + 100;
+    let id = make_sub(&env, &client, Some(future));
+
+    // Jump to one second before expiration.
+    env.ledger().set_timestamp(future - 1);
+    let result = client.try_charge_subscription(&id);
+    assert!(result.is_ok());
 }
 
 #[test]
-fn test_charge_subscription_not_yet_due() {
-    let (env, contract_id, token_address, _admin) = setup();
-    let subscriber = Address::generate(&env);
-    let merchant = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 100, 86_400);
-    fund_subscription(&env, &token_address, &contract_id, id, &subscriber, 1000);
-    let result = SubscriptionVaultClient::new(&env, &contract_id).try_charge_subscription(&id);
-    assert!(result.is_err());
+fn test_charge_at_exact_expiration_rejected() {
+    let (env, client) = setup();
+    let now = env.ledger().timestamp();
+    let future = now + 100;
+    let id = make_sub(&env, &client, Some(future));
+
+    // Jump to exactly the expiration timestamp.
+    env.ledger().set_timestamp(future);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::SubscriptionExpired)));
 }
 
 #[test]
-fn test_batch_charge_all_active() {
-    let (env, contract_id, token_address, _admin) = setup();
-    let merchant = Address::generate(&env);
-    let mut ids = vec![&env];
-    for _ in 0..3 {
-        let sub = Address::generate(&env);
-        let id = make_subscription(&env, &contract_id, &sub, &merchant, 50, 0);
-        env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-        fund_subscription(&env, &token_address, &contract_id, id, &sub, 50);
-        ids.push_back(id);
+fn test_charge_after_expiration_rejected() {
+    let (env, client) = setup();
+    let now = env.ledger().timestamp();
+    let future = now + 100;
+    let id = make_sub(&env, &client, Some(future));
+
+    // Jump to one second after expiration.
+    env.ledger().set_timestamp(future + 1);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::SubscriptionExpired)));
+}
+
+#[test]
+fn test_charge_long_after_expiration_rejected() {
+    let (env, client) = setup();
+    let now = env.ledger().timestamp();
+    let future = now + 100;
+    let id = make_sub(&env, &client, Some(future));
+
+    // Far in the future.
+    env.ledger().set_timestamp(future + 100_000);
+    let result = client.try_charge_subscription(&id);
+    assert_eq!(result, Err(Ok(Error::SubscriptionExpired)));
+}
+
+#[test]
+fn test_charge_open_ended_never_expires() {
+    let (env, client) = setup();
+    let id = make_sub(&env, &client, None);
+
+    // Far in the future — no expiration set, so charge should succeed.
+    env.ledger().set_timestamp(u64::MAX);
+    let result = client.try_charge_subscription(&id);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_charge_open_ended_at_creation_time_succeeds() {
+    let (env, client) = setup();
+    let id = make_sub(&env, &client, None);
+
+    // At creation timestamp.
+    let result = client.try_charge_subscription(&id);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_charge_subscription_not_found() {
+    let (_env, client) = setup();
+    let result = client.try_charge_subscription(&999u32);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn test_charge_expired_subscription_id_does_not_affect_other_ids() {
+    let (env, client) = setup();
+    let now = env.ledger().timestamp();
+    let future = now + 100;
+
+    // Create one expiring and one open-ended subscription.
+    let expired_id = make_sub(&env, &client, Some(future));
+    let open_id = make_sub(&env, &client, None);
+
+    env.ledger().set_timestamp(future + 1);
+
+    let result_expired = client.try_charge_subscription(&expired_id);
+    assert_eq!(result_expired, Err(Ok(Error::SubscriptionExpired)));
+
+    let result_open = client.try_charge_subscription(&open_id);
+    assert!(result_open.is_ok());
+}
+
+// --- ID sequencing -----------------------------------------------------------
+
+#[test]
+fn test_id_starts_at_zero() {
+    let (env, client) = setup();
+    let id = make_sub(&env, &client, None);
+    assert_eq!(id, 0);
+}
+
+#[test]
+fn test_ids_are_monotonically_increasing() {
+    let (env, client) = setup();
+    for expected in 0..10 {
+        let id = make_sub(&env, &client, None);
+        assert_eq!(id, expected);
     }
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    for r in results.iter() {
-        assert!(r.success);
-    }
 }
 
 #[test]
-fn test_batch_charge_mixed() {
-    let (env, contract_id, token_address, _admin) = setup();
-    let merchant = Address::generate(&env);
-    let sub_a = Address::generate(&env);
-    let id_a = make_subscription(&env, &contract_id, &sub_a, &merchant, 100, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    fund_subscription(&env, &token_address, &contract_id, id_a, &sub_a, 100);
-    let sub_b = Address::generate(&env);
-    let id_b = make_subscription(&env, &contract_id, &sub_b, &merchant, 100, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    let sub_c = Address::generate(&env);
-    let id_c = make_subscription(&env, &contract_id, &sub_c, &merchant, 100, 999_999);
-    fund_subscription(&env, &token_address, &contract_id, id_c, &sub_c, 100);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    let ids = vec![&env, id_a, id_b, id_c];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    let find = |target: u64| results.iter().find(|r| r.subscription_id == target).unwrap();
-    assert!(find(id_a).success);
-    assert!(!find(id_b).success);
-    assert!(!find(id_c).success);
+fn test_get_subscription_count_matches_creations() {
+    let (env, client) = setup();
+    assert_eq!(client.get_subscription_count(), 0);
+    make_sub(&env, &client, None);
+    assert_eq!(client.get_subscription_count(), 1);
+    make_sub(&env, &client, None);
+    assert_eq!(client.get_subscription_count(), 2);
 }
 
-#[test]
-fn test_batch_charge_empty_list() {
-    let (env, contract_id, _token_address, _admin) = setup();
-    let ids: soroban_sdk::Vec<u64> = vec![&env];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    assert_eq!(results.len(), 0);
-}
+// --- get_subscription round-trip --------------------------------------------
 
 #[test]
-fn test_batch_charge_nonexistent_id() {
-    let (env, contract_id, _token_address, _admin) = setup();
-    let ids = vec![&env, 9999u64];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    assert!(!results.get(0).unwrap().success);
-    assert_eq!(results.get(0).unwrap().message, soroban_sdk::String::from_str(&env, "not_found"));
-}
-
-#[test]
-fn test_batch_charge_duplicate_ids() {
-    let (env, contract_id, token_address, _admin) = setup();
-    let merchant = Address::generate(&env);
+fn test_get_subscription_returns_matching_fields() {
+    let (env, client) = setup();
     let subscriber = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 50, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    fund_subscription(&env, &token_address, &contract_id, id, &subscriber, 200);
-    let ids = vec![&env, id, id];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    assert_eq!(results.len(), 2);
-    assert!(results.get(0).unwrap().success);
-    assert!(!results.get(1).unwrap().success);
+    let merchant = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    let future = now + 86400;
+
+    let id = client.create_subscription(
+        &subscriber, &merchant, &5000i128, &7200u64, &true, &Some(future),
+    );
+    let stored = client.get_subscription(&id);
+    assert_eq!(stored.subscriber, subscriber);
+    assert_eq!(stored.merchant, merchant);
+    assert_eq!(stored.amount, 5000);
+    assert_eq!(stored.interval_seconds, 7200);
+    assert_eq!(stored.last_payment_timestamp, now);
+    assert_eq!(stored.status, SubscriptionStatus::Active);
+    assert_eq!(stored.prepaid_balance, 0);
+    assert!(stored.usage_enabled);
+    assert_eq!(stored.expires_at, Some(future));
 }
 
 #[test]
-fn test_batch_charge_paused_skipped() {
-    let (env, contract_id, token_address, _admin) = setup();
+fn test_get_subscription_without_expiration() {
+    let (env, client) = setup();
+    let id = make_sub(&env, &client, None);
+    let stored = client.get_subscription(&id);
+    assert_eq!(stored.expires_at, None);
+}
+
+// --- NotFound ---------------------------------------------------------------
+
+#[test]
+fn test_get_subscription_unknown_id_returns_not_found() {
+    let (_env, client) = setup();
+    let result = client.try_get_subscription(&999u32);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+// --- Input validation -------------------------------------------------------
+
+#[test]
+fn test_create_subscription_zero_amount_rejected() {
+    let (env, client) = setup();
+    let sub = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let subscriber = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 100, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    fund_subscription(&env, &token_address, &contract_id, id, &subscriber, 100);
-    SubscriptionVaultClient::new(&env, &contract_id).pause_subscription(&id);
-    let ids = vec![&env, id];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    assert!(!results.get(0).unwrap().success);
+
+    let result = client.try_create_subscription(&sub, &merchant, &0i128, &3600u64, &false, &None);
+    assert_eq!(result, Err(Ok(Error::InvalidArgument)));
 }
 
 #[test]
-fn test_batch_charge_cancelled_skipped() {
-    let (env, contract_id, token_address, _admin) = setup();
+fn test_create_subscription_negative_amount_rejected() {
+    let (env, client) = setup();
+    let sub = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let subscriber = Address::generate(&env);
-    let id = make_subscription(&env, &contract_id, &subscriber, &merchant, 100, 0);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-    fund_subscription(&env, &token_address, &contract_id, id, &subscriber, 100);
-    SubscriptionVaultClient::new(&env, &contract_id).cancel_subscription(&id);
-    let ids = vec![&env, id];
-    let results = SubscriptionVaultClient::new(&env, &contract_id).batch_charge(&ids);
-    assert!(!results.get(0).unwrap().success);
+
+    let result = client.try_create_subscription(&sub, &merchant, &(-1i128), &3600u64, &false, &None);
+    assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+}
+
+#[test]
+fn test_create_subscription_zero_interval_rejected() {
+    let (env, client) = setup();
+    let sub = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let result = client.try_create_subscription(&sub, &merchant, &1000i128, &0u64, &false, &None);
+    assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+}
+
+#[test]
+fn test_create_subscription_past_expiration_rejected() {
+    let (env, client) = setup();
+    let sub = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let now = env.ledger().timestamp();
+    let result = client.try_create_subscription(&sub, &merchant, &1000i128, &3600u64, &false, &Some(now));
+    assert_eq!(result, Err(Ok(Error::InvalidArgument)));
 }
