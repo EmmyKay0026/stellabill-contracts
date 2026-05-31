@@ -385,7 +385,7 @@ pub fn set_protocol_fee(
     env.events().publish(
         (Symbol::new(env, "protocol_fee_configured"),),
         crate::types::ProtocolFeeConfiguredEvent {
-            admin,
+            admin: admin.clone(),
             treasury,
             fee_bps,
             timestamp: env.ledger().timestamp(),
