@@ -248,34 +248,7 @@ pub mod oracle {
 
 mod reentrancy;
 
-/// Nonce: replay-protection counters for privileged operations.
-///
-/// Persistent, domain-separated, monotonic per-`(signer, domain)` counters. A
-/// captured nonce in one domain can never be replayed in another because the
-/// domain is part of the storage key. Auth **must** be verified before calling
-/// [`check_and_advance`] so invalid signers are rejected before any counter is
-/// touched.
-pub mod nonce {
-    #![allow(unused_variables, dead_code)]
-    use soroban_sdk::{Address, Env, Symbol};
-    use crate::types::{DataKey, Error};
-
-    pub const DOMAIN_BATCH_CHARGE: u32 = 0;
-    pub const DOMAIN_ADMIN_ROTATION: u32 = 1;
-    pub const DOMAIN_OPERATOR_BATCH_CHARGE: u32 = 2;
-
-    pub fn get_nonce(_env: &Env, _signer: &Address, _domain: u32) -> u64 {
-        0
-    }
-    pub fn check_and_advance(
-        _env: &Env,
-        _signer: &Address,
-        _domain: u32,
-        _expected: u64,
-    ) -> Result<(), crate::types::Error> {
-        Ok(())
-    }
-}
+mod nonce;
 
 /// Operator: least-privilege charge delegate.
 ///
