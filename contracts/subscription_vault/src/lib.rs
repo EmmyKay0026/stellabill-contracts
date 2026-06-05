@@ -227,6 +227,10 @@ pub mod operator {
     use crate::types::{BatchChargeResult, ChargeExecutionResult, Error, UsageChargeResult};
     use soroban_sdk::{Address, Env, String, Vec};
 
+    fn require_operator_auth(_env: &Env, _op: &Address) -> Result<Address, Error> {
+        Ok(_op.clone())
+    }
+
     pub fn do_set_operator(_env: &Env, _admin: Address, _operator: Address) -> Result<(), Error> {
         Ok(())
     }
@@ -237,40 +241,40 @@ pub mod operator {
         None
     }
     pub fn do_operator_batch_charge(
-        _env: &Env,
-        _operator: Address,
-        _ids: &Vec<u32>,
-        _nonce: u64,
+        env: &Env,
+        operator: Address,
+        ids: &Vec<u32>,
+        nonce: u64,
     ) -> Result<Vec<BatchChargeResult>, Error> {
         Ok(Vec::new(_env))
     }
 
     /// Single interval charge driven by the operator.
     pub fn do_operator_charge_subscription(
-        _env: &Env,
-        _op: Address,
-        _subscription_id: u32,
+        env: &Env,
+        op: Address,
+        subscription_id: u32,
     ) -> Result<ChargeExecutionResult, Error> {
         Ok(ChargeExecutionResult::Charged)
     }
 
     /// Metered usage charge driven by the operator (no reference).
     pub fn do_operator_charge_usage(
-        _env: &Env,
-        _op: Address,
-        _subscription_id: u32,
-        _usage_amount: i128,
+        env: &Env,
+        op: Address,
+        subscription_id: u32,
+        usage_amount: i128,
     ) -> Result<UsageChargeResult, Error> {
         Ok(UsageChargeResult::Charged)
     }
 
     /// Metered usage charge driven by the operator, with a reference string.
     pub fn do_operator_charge_usage_with_reference(
-        _env: &Env,
-        _op: Address,
-        _subscription_id: u32,
-        _usage_amount: i128,
-        _reference: String,
+        env: &Env,
+        op: Address,
+        subscription_id: u32,
+        usage_amount: i128,
+        reference: String,
     ) -> Result<UsageChargeResult, Error> {
         Ok(UsageChargeResult::Charged)
     }
@@ -1748,6 +1752,9 @@ impl SubscriptionVault {
             charge_core::charge_one(&env, subscription_id, timestamp, None)?;
         let new_sub = queries::get_subscription(&env, subscription_id)?;
 
+        let period_start = old_sub.last_payment_timestamp;
+        let period_end = timestamp;
+
         env.events().publish(
             (Symbol::new(&env, "charged"),),
             SubscriptionChargedEvent {
@@ -1881,9 +1888,12 @@ impl SubscriptionVault {
     /// token transfer. The guard is automatically released (even on error) via the
     /// Drop trait, guaranteeing cleanup.
     pub fn withdraw_merchant_funds(env: Env, merchant: Address, amount: i128) -> Result<(), Error> {
+        require_not_emergency_stop(&env)?;
+
         // Acquire reentrancy guard: prevents re-entry during token transfer
         let _guard = crate::reentrancy::ReentrancyGuard::lock(&env, "withdraw_merchant_funds")?;
 
+        let timestamp = env.ledger().timestamp();
         merchant::withdraw_merchant_funds(&env, merchant.clone(), amount)?;
 
         let new_balance = merchant::get_merchant_balance(&env, &merchant);
@@ -1933,6 +1943,8 @@ impl SubscriptionVault {
         token: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        require_not_emergency_stop(&env)?;
+
         // Acquire reentrancy guard: prevents re-entry during token transfer
         let _guard =
             crate::reentrancy::ReentrancyGuard::lock(&env, "withdraw_merchant_token_funds")?;
@@ -2568,7 +2580,7 @@ impl SubscriptionVault {
         key: String,
         value: String,
     ) -> Result<(), Error> {
-        metadata::do_set_metadata(&env, authorizer, subscription_id, key, value)
+        metadata::set_metadata(&env, subscription_id, &authorizer, key, value)
     }
 
     ///
@@ -2598,7 +2610,7 @@ impl SubscriptionVault {
         authorizer: Address,
         key: String,
     ) -> Result<(), Error> {
-        metadata::do_delete_metadata(&env, authorizer, subscription_id, key)
+        metadata::delete_metadata(&env, subscription_id, &authorizer, key)
     }
 
     /// Get a metadata value by key.
