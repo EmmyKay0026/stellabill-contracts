@@ -21,6 +21,7 @@ mod queries;
 mod safe_math;
 mod subscription;
 mod types;
+mod validation;
 pub mod period_snapshots;
 
 pub use safe_math::*;
@@ -113,36 +114,7 @@ pub mod statements {
     }
 }
 
-/// Period snapshots: write billing-period summaries for reconciliation.
-pub mod period_snapshots {
-    #![allow(unused_variables, dead_code)]
-    use crate::types::{
-        BillingPeriodSnapshot, DataKey, Error, BILLING_PERIOD_SNAPSHOT_TTL_EXTEND_TO,
-        BILLING_PERIOD_SNAPSHOT_TTL_THRESHOLD,
-    };
-    use soroban_sdk::Env;
 
-    pub fn write_period_snapshot(
-        _env: &Env,
-        _snapshot: BillingPeriodSnapshot,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-    pub fn get_period_snapshot(
-        _env: &Env,
-        _subscription_id: u32,
-        _period_index: u64,
-    ) -> Option<BillingPeriodSnapshot> {
-        None
-    }
-    pub fn list_period_snapshots(
-        _env: &Env,
-        _subscription_id: u32,
-        _limit: u32,
-    ) -> soroban_sdk::Vec<BillingPeriodSnapshot> {
-        soroban_sdk::Vec::new(_env)
-    }
-}
 
 /// Accounting: tracks total tokens accounted for across all subscriptions.
 ///
@@ -246,7 +218,7 @@ pub mod operator {
         ids: &Vec<u32>,
         nonce: u64,
     ) -> Result<Vec<BatchChargeResult>, Error> {
-        Ok(Vec::new(_env))
+        Ok(Vec::new(env))
     }
 
     /// Single interval charge driven by the operator.
@@ -2147,6 +2119,7 @@ impl SubscriptionVault {
         merchant: Address,
         cap: Option<i128>,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &merchant)?;
         subscription::do_set_merchant_cap_default(&env, merchant, cap)
     }
 
@@ -2242,6 +2215,7 @@ impl SubscriptionVault {
         token: Address,
         decimals: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &token)?;
         admin::add_accepted_token(&env, admin, token, decimals)
     }
 
@@ -2580,6 +2554,8 @@ impl SubscriptionVault {
         key: String,
         value: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
+        validation::reject_empty_string(&value)?;
         metadata::set_metadata(&env, subscription_id, &authorizer, key, value)
     }
 
@@ -2610,6 +2586,7 @@ impl SubscriptionVault {
         authorizer: Address,
         key: String,
     ) -> Result<(), Error> {
+        validation::reject_empty_string(&key)?;
         metadata::delete_metadata(&env, subscription_id, &authorizer, key)
     }
 
@@ -2654,6 +2631,7 @@ impl SubscriptionVault {
         treasury: Address,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        validation::reject_contract_self(&env, &treasury)?;
         admin::set_protocol_fee(&env, admin, treasury, fee_bps)
     }
 
@@ -2931,7 +2909,15 @@ mod test_charge_invariants;
 
 #[cfg(test)]
 mod test_billing_period_snapshots;
+
+#[cfg(test)]
 mod test_insufficient_balance;
+
+#[cfg(test)]
+mod test_validation;
+
+#[cfg(test)]
+mod test_abi_validators_integration;
 
 #[cfg(test)]
 mod test {
